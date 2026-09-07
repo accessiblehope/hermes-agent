@@ -114,28 +114,23 @@ class TurnFacadeMixin:
                 getattr(self, "_session_db", None), getattr(self, "session_id", None)
             )
 
-            stream_suppressed_before = getattr(self, "_public_stream_suppressed", False)
-            self._public_stream_suppressed = True
-            try:
-                with bind_subagent_parent(self), scoped_runtime_main({}):
-                    try:
-                        if lease is not None:
-                            lease.start()
-                        result = run_conversation(
-                            self, user_message, system_message, conversation_history, effective_task_id,
-                            stream_callback, persist_user_message,
-                            persist_user_timestamp=persist_user_timestamp,
-                            persist_user_display_kind=persist_user_display_kind,
-                            persist_user_display_metadata=persist_user_display_metadata,
-                            persist_user_platform_id=persist_user_platform_id, moa_config=moa_config,
-                        )
-                    finally:
-                        # Post-loop relay/task finalization must not receive a late refresh interrupt;
-                        # the interrupt clear itself waits for the thread join in the outer finally.
-                        if lease is not None:
-                            lease.stop_refresher()
-            finally:
-                self._public_stream_suppressed = stream_suppressed_before
+            with bind_subagent_parent(self), scoped_runtime_main({}):
+                try:
+                    if lease is not None:
+                        lease.start()
+                    result = run_conversation(
+                        self, user_message, system_message, conversation_history, effective_task_id,
+                        stream_callback, persist_user_message,
+                        persist_user_timestamp=persist_user_timestamp,
+                        persist_user_display_kind=persist_user_display_kind,
+                        persist_user_display_metadata=persist_user_display_metadata,
+                        persist_user_platform_id=persist_user_platform_id, moa_config=moa_config,
+                    )
+                finally:
+                    # Post-loop relay/task finalization must not receive a late refresh interrupt;
+                    # the interrupt clear itself waits for the thread join in the outer finally.
+                    if lease is not None:
+                        lease.stop_refresher()
             # Mandatory owner-facing stop boundary: no public turn may escape without
             # exactly one canonical terminal outcome. Internal child/tool turns remain
             # structured data and are excluded by the adapter.
