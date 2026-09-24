@@ -11,6 +11,8 @@ model/provider. Logger name stays ``agent.conversation_loop`` for caplog parity.
 from __future__ import annotations
 
 import logging
+import time
+import uuid
 from contextlib import suppress
 from dataclasses import dataclass
 from typing import Any, Dict, List
@@ -61,6 +63,39 @@ def _fold_moa_usage(agent, canonical_usage):
         except Exception as _moa_trace_exc:  # pragma: no cover - defensive
             logger.debug("MoA trace flush failed: %s", _moa_trace_exc)
     return _moa_client, canonical_usage, _moa_ref_cost
+
+
+def _usage_event_identity(agent: Any, response: Any) -> tuple[str, Any]:
+    """Return an idempotent event id and the provider id, if the response supplied one."""
+    response_id = getattr(response, "id", None)
+    if response_id not in (None, ""):
+        response_id = str(response_id)
+        return response_id, response_id
+
+    request_id = getattr(agent, "_current_api_request_id", None)
+    if request_id:
+        # The request id is stable across repeated persistence of the same response. UUID5 keeps
+        # the event id in the UUID form required for providers that omit their own response id.
+        return str(uuid.uuid5(
+            uuid.NAMESPACE_URL, f"hermes:usage-event:{agent.session_id}:{request_id}"
+        )), None
+
+    marker = getattr(response, "_hermes_usage_event_id", None)
+    cache = getattr(agent, "_hermes_usage_event_ids", None)
+    if not marker and isinstance(cache, dict):
+        marker = cache.get(id(response))
+    if not marker:
+        marker = str(uuid.uuid4())
+        with suppress(Exception):
+            setattr(response, "_hermes_usage_event_id", marker)
+        if not isinstance(cache, dict):
+            cache = agent._hermes_usage_event_ids = {}
+        cache[id(response)] = marker
+    else:
+        cache = getattr(agent, "_hermes_usage_event_ids", None)
+        if isinstance(cache, dict):
+            cache[id(response)] = str(marker)
+    return str(marker), None
 
 
 def record_response_usage(
@@ -246,6 +281,35 @@ def record_response_usage(
             # _ensure_db_session() may fail, and UPDATE on a missing row affects 0 rows.
             if not agent._session_db_created:
                 agent._ensure_db_session()
+            try:
+                _event_id, _provider_response_id = _usage_event_identity(agent, response)
+                _actual_cost = getattr(response, "actual_cost_usd", None)
+                if _actual_cost is None:
+                    _actual_cost = getattr(response.usage, "actual_cost_usd", None)
+                try:
+                    _actual_cost = None if _actual_cost is None else float(_actual_cost)
+                except (TypeError, ValueError):
+                    _actual_cost = None
+                agent._session_db.record_usage_event(
+                    _event_id, agent.session_id, occurred_at=time.time(),
+                    provider_response_id=_provider_response_id, model=agent.model,
+                    billing_provider=agent.provider, billing_base_url=agent.base_url,
+                    billing_mode=(
+                        "subscription_included" if cost_result.status == "included"
+                        else getattr(agent, "api_mode", None)
+                    ),
+                    task=getattr(agent, "_current_task_id", None),
+                    input_tokens=canonical_usage.input_tokens,
+                    output_tokens=canonical_usage.output_tokens,
+                    cache_read_tokens=canonical_usage.cache_read_tokens,
+                    cache_write_tokens=canonical_usage.cache_write_tokens,
+                    reasoning_tokens=canonical_usage.reasoning_tokens,
+                    estimated_cost_usd=_cost_delta, actual_cost_usd=_actual_cost,
+                    cost_status=cost_result.status, cost_source=cost_result.source,
+                    pricing_version=getattr(cost_result, "pricing_version", None),
+                )
+            except Exception as e:
+                logger.debug("Usage event persistence failed (session=%s): %s", agent.session_id, e)
             agent._session_db.queue_token_counts(
                 agent.session_id,
                 input_tokens=canonical_usage.input_tokens,

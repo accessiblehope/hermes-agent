@@ -384,6 +384,47 @@ class SessionUsageMixin:
         self._insert_session_row(session_id, "unknown")
         self._execute_write(lambda conn: self._record_model_usage(conn, session_id, task=task, **usage))
 
+    def record_usage_event(
+        self, event_id: str, session_id: str, *, occurred_at: float,
+        provider_response_id: Optional[str] = None, model: Optional[str] = None,
+        billing_provider: Optional[str] = None, billing_base_url: Optional[str] = None,
+        billing_mode: Optional[str] = None, task: Optional[str] = None,
+        input_tokens: int = 0, output_tokens: int = 0, cache_read_tokens: int = 0,
+        cache_write_tokens: int = 0, reasoning_tokens: int = 0,
+        estimated_cost_usd: Optional[float] = None, actual_cost_usd: Optional[float] = None,
+        cost_status: Optional[str] = None, cost_source: Optional[str] = None,
+        pricing_version: Optional[str] = None,
+    ) -> None:
+        """Persist one response-level usage event, ignoring a repeated event id.
+
+        The insert is deliberately independent from cumulative session accounting: the event is an
+        immutable response fact, while ``session_model_usage`` remains the existing aggregate ledger.
+        """
+        if not event_id or not session_id:
+            return
+        self._insert_session_row(session_id, "unknown", model=model)
+        counts = [
+            int(input_tokens or 0), int(output_tokens or 0), int(cache_read_tokens or 0),
+            int(cache_write_tokens or 0), int(reasoning_tokens or 0),
+        ]
+        self._execute_write(
+            lambda conn: conn.execute(
+                """INSERT INTO usage_events (
+                       event_id, session_id, occurred_at, provider_response_id, model,
+                       billing_provider, billing_base_url, billing_mode, task,
+                       input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
+                       reasoning_tokens, estimated_cost_usd, actual_cost_usd, cost_status,
+                       cost_source, pricing_version
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(event_id) DO NOTHING""",
+                (
+                    event_id, session_id, float(occurred_at), provider_response_id, model or "unknown",
+                    billing_provider or "", billing_base_url or "", billing_mode or "", task or "",
+                    *counts, estimated_cost_usd, actual_cost_usd, cost_status, cost_source, pricing_version,
+                ),
+            )
+        )
+
     def usage_totals(self, *, min_message_count: int = 1, include_archived: bool = False) -> Dict[str, float]:
         """Tokens and spend across the whole store (one scan), so the sidebar total does not
         shrink with paging. Spend prefers the billed figure over the estimate."""
