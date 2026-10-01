@@ -1863,9 +1863,71 @@ class ProcessRegistry(ProcessCheckpointMixin):
         return self._any_running(lambda s: s.task_id == task_id)
 
     def running_owned_by(self, owner_task_id: str) -> List[ProcessSession]:
-        """Running processes whose RAW spawning owner is ``owner_task_id``."""
+        """Running processes whose RAW spawning owner is ``owner_task_id``.
+
+        Detached sessions recovered from a checkpoint are refreshed first so a
+        stale conversation/session receipt cannot make a dead PID count as live.
+        """
+        with self._lock:
+            sessions = list(self._running.values())
+        for session in sessions:
+            self._refresh_detached_session(session)
         with self._lock:
             return [s for s in self._running.values() if s.owner_task_id == owner_task_id and not s.exited]
+
+    @staticmethod
+    def _owned_execution_record(session: ProcessSession) -> dict:
+        """Return non-secret identity for one owned running process."""
+        return {
+            "session_id": session.id,
+            "pid": session.pid,
+            "owner_task_id": session.owner_task_id,
+            "task_id": session.task_id,
+            "status": "running",
+        }
+
+    def reconcile_owned_execution(self, owner_task_id: str) -> dict:
+        """Read the authoritative execution state for one governed owner.
+
+        The process registry is the source of truth, not conversational
+        bookkeeping. A finished notification is not execution authority: the
+        process has already left ``_running`` and therefore contributes zero to
+        ``owned_running_work``. Queued execution is currently not a separate
+        registry state, so it is explicitly reported as zero rather than
+        inferred from notification events.
+        """
+        owner = str(owner_task_id or "")
+        if not owner:
+            return {
+                "reconciled": False,
+                "owner_task_id": owner,
+                "owned_running_work": 0,
+                "owned_queued_work": 0,
+                "owned_work": [],
+                "reason": "missing execution owner",
+            }
+        running = self.running_owned_by(owner)
+        return {
+            "reconciled": True,
+            "owner_task_id": owner,
+            "owned_running_work": len(running),
+            "owned_queued_work": 0,
+            "owned_work": [self._owned_execution_record(session) for session in running],
+        }
+
+    def terminate_owned_execution(self, owner_task_id: str) -> dict:
+        """Revoke all running execution owned by ``owner_task_id`` and reconcile."""
+        targets = self.running_owned_by(owner_task_id)
+        results = [
+            self.kill_process(session.id, source="objective.terminate", consume_output=True)
+            for session in targets
+        ]
+        snapshot = self.reconcile_owned_execution(owner_task_id)
+        snapshot["termination_results"] = results
+        snapshot["termination_confirmed"] = (
+            snapshot["owned_running_work"] == 0 and snapshot["owned_queued_work"] == 0
+        )
+        return snapshot
 
     def unread_completions_owned_by(self, owner_task_id: str) -> List[ProcessSession]:
         """Exited ``notify_on_complete`` processes of ``owner_task_id`` whose result nobody read (no wait/log/poll).

@@ -138,6 +138,7 @@ class TurnFacadeMixin:
             result = enforce_public_terminal_response(
                 result if isinstance(result, dict) else {},
                 platform=task_context["platform"],
+                task_id=effective_task_id,
             )
             terminal = result if isinstance(result, dict) else {}
             relay_outcome = (
@@ -174,6 +175,7 @@ class TurnFacadeMixin:
                 return enforce_public_terminal_response(
                     {"failed": True, "completed": False, "error": str(exc)},
                     platform=task_context["platform"],
+                    task_id=effective_task_id,
                 )
             raise
         finally:

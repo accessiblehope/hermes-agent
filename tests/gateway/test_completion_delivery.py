@@ -286,14 +286,14 @@ def test_process_tool_redacts_explicit_kill_output(monkeypatch):
     assert result["output"] == "PRIVATE_TOKEN=<redacted>\n"
 
 
-def test_autonomous_completion_redacts_real_command_and_output_secrets(monkeypatch):
+def test_completion_notification_redacts_real_command_and_output_secrets(monkeypatch):
     import agent.redact as redact_module
     import tools.process_registry as pr_module
 
     secret = "abc123randomopaquetokenvalue999"
     registry = ProcessRegistry()
     session = ProcessSession(
-        id="proc_autonomous_redaction",
+        id="proc_completion_redaction",
         command=f"printenv MY_SERVICE_TOKEN={secret}",
         task_id="task",
         started_at=1234.5,
@@ -306,7 +306,7 @@ def test_autonomous_completion_redacts_real_command_and_output_secrets(monkeypat
     monkeypatch.setattr(pr_module, "process_registry", registry)
     monkeypatch.setattr(redact_module, "_REDACT_ENABLED", True)
 
-    adapter = SimpleNamespace(handle_message=AdmittingHandler())
+    adapter = SimpleNamespace(handle_message=AdmittingHandler(), send=AsyncMock())
     runner = _runner(adapter)
 
     async def _instant_sleep(*_a, **_kw):
@@ -323,13 +323,14 @@ def test_autonomous_completion_redacts_real_command_and_output_secrets(monkeypat
         "notify_on_complete": True,
     }))
 
-    delivered = adapter.handle_message.await_args.args[0]
-    assert secret not in delivered.text
-    assert "HOME=/home/user" in delivered.text
+    adapter.handle_message.assert_not_awaited()
+    delivered = adapter.send.await_args.args[1]
+    assert secret not in delivered
+    assert "HOME=/home/user" in delivered
 
 
-def test_concurrent_process_watchers_coalesce_one_session_completion_turn(monkeypatch):
-    """Concurrent terminal watchers for one session must re-enter the agent once."""
+def test_process_completion_notification_does_not_create_autonomous_turn(monkeypatch):
+    """Completion notification is informational, even when three watchers finish together."""
     import tools.process_registry as pr_module
 
     registry = ProcessRegistry()
@@ -357,7 +358,7 @@ def test_concurrent_process_watchers_coalesce_one_session_completion_turn(monkey
         })
     monkeypatch.setattr(pr_module, "process_registry", registry)
 
-    adapter = SimpleNamespace(handle_message=AdmittingHandler())
+    adapter = SimpleNamespace(handle_message=AdmittingHandler(), send=AsyncMock())
     runner = _runner(adapter)
 
     async def _exercise():
@@ -366,117 +367,14 @@ def test_concurrent_process_watchers_coalesce_one_session_completion_turn(monkey
             for watcher in watchers
         ))
 
-    asyncio.run(_exercise())
+    with patch("gateway.wake.admit_internal_event", new=AsyncMock()) as admit:
+        asyncio.run(_exercise())
 
-    adapter.handle_message.assert_awaited_once()
-    delivered = adapter.handle_message.await_args.args[0]
-    assert "3 background processes completed" in delivered.text
+    admit.assert_not_awaited()
+    adapter.handle_message.assert_not_awaited()
+    assert adapter.send.await_count == 3
     for index in range(3):
-        assert f"proc_batch_{index}" in delivered.text
-
-
-def test_completion_arriving_during_batch_delivery_schedules_next_flush():
-    """A new event cannot be stranded behind an in-flight batch for its route."""
-    first_delivery_entered = asyncio.Event()
-    release_first_delivery = asyncio.Event()
-    delivery_count = 0
-
-    async def _deliver(_event):
-        nonlocal delivery_count
-        delivery_count += 1
-        if delivery_count == 1:
-            first_delivery_entered.set()
-            await release_first_delivery.wait()
-
-    adapter = SimpleNamespace(handle_message=AdmittingHandler(side_effect=_deliver))
-    runner = _runner(adapter)
-
-    async def _exercise():
-        first = asyncio.create_task(runner._enqueue_process_completion_notification(
-            "first completion",
-            _completion_event(started_at=1.0, session_id="proc_first"),
-        ))
-        await first_delivery_entered.wait()
-        second = asyncio.create_task(runner._enqueue_process_completion_notification(
-            "second completion",
-            _completion_event(started_at=2.0, session_id="proc_second"),
-        ))
-        release_first_delivery.set()
-        assert await first is True
-        assert await asyncio.wait_for(second, timeout=1.0) is True
-
-    asyncio.run(_exercise())
-
-    assert adapter.handle_message.await_count == 2
-
-
-def test_completion_batches_do_not_cross_conversation_routes():
-    adapter = SimpleNamespace(handle_message=AdmittingHandler())
-    runner = _runner(adapter)
-
-    first = _completion_event(started_at=1.0, session_id="proc_route_a")
-    second = _completion_event(started_at=2.0, session_id="proc_route_b")
-    second["session_key"] = "agent:main:telegram:dm:456"
-    second["chat_id"] = "456"
-
-    async def _exercise():
-        return await asyncio.gather(
-            runner._enqueue_process_completion_notification("first", first),
-            runner._enqueue_process_completion_notification("second", second),
-        )
-
-    assert asyncio.run(_exercise()) == [True, True]
-    assert adapter.handle_message.await_count == 2
-
-
-def test_failed_coalesced_delivery_retries_all_entries():
-    attempts = 0
-
-    async def _deliver(_event):
-        nonlocal attempts
-        attempts += 1
-        if attempts == 1:
-            raise RuntimeError("temporary adapter failure")
-
-    adapter = SimpleNamespace(handle_message=AdmittingHandler(side_effect=_deliver))
-    runner = _runner(adapter)
-    events = [
-        _completion_event(started_at=float(index), session_id=f"proc_retry_{index}")
-        for index in range(2)
-    ]
-
-    async def _enqueue_all():
-        return await asyncio.gather(*(
-            runner._enqueue_process_completion_notification(f"event-{index}", event)
-            for index, event in enumerate(events)
-        ))
-
-    async def _exercise():
-        assert await _enqueue_all() == [False, False]
-        assert await _enqueue_all() == [True, True]
-
-    asyncio.run(_exercise())
-    assert adapter.handle_message.await_count == 2
-
-
-def test_coalesced_success_records_every_completion_identity():
-    adapter = SimpleNamespace(handle_message=AdmittingHandler())
-    runner = _runner(adapter)
-    events = [
-        _completion_event(started_at=float(index), session_id=f"proc_ledger_{index}")
-        for index in range(3)
-    ]
-
-    async def _exercise():
-        return await asyncio.gather(*(
-            runner._enqueue_process_completion_notification(f"event-{index}", event)
-            for index, event in enumerate(events)
-        ))
-
-    assert asyncio.run(_exercise()) == [True, True, True]
-    for event in events:
-        identity = runner._completion_delivery_identity(event)
-        assert identity in runner._completion_deliveries_delivered
+        assert any(f"proc_batch_{index}" in call.args[1] for call in adapter.send.await_args_list)
 
 
 def test_coalesced_format_bounds_details_and_reports_omitted_count():
@@ -549,26 +447,6 @@ def test_coalesced_format_redacts_before_truncating_output(monkeypatch):
     text = asyncio.run(_format())
 
     assert marker not in text
-
-
-def test_duplicate_primary_does_not_discard_fresh_batch_sibling():
-    adapter = SimpleNamespace(handle_message=AdmittingHandler())
-    runner = _runner(adapter)
-    duplicate = _completion_event(started_at=1.0, session_id="proc_duplicate")
-    fresh = _completion_event(started_at=2.0, session_id="proc_fresh")
-    duplicate_identity = runner._completion_delivery_identity(duplicate)
-    runner._completion_deliveries_delivered[duplicate_identity] = None
-
-    async def _exercise():
-        return await asyncio.gather(
-            runner._enqueue_process_completion_notification("duplicate", duplicate),
-            runner._enqueue_process_completion_notification("fresh", fresh),
-        )
-
-    assert asyncio.run(_exercise()) == [True, True]
-    adapter.handle_message.assert_awaited_once()
-    fresh_identity = runner._completion_delivery_identity(fresh)
-    assert fresh_identity in runner._completion_deliveries_delivered
 
 
 def test_batch_format_failure_resolves_waiters_for_retry(monkeypatch):

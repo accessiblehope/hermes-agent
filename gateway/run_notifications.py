@@ -1570,18 +1570,16 @@ class GatewayNotificationsMixin:
             has_new_output = current_output_len > last_output_len
             last_output_len = current_output_len
             if session.exited:
-                # Agent-notify: inject a synthetic message unless the agent already consumed the result via
-                # wait/log (poll() is read-only and deliberately does NOT mark consumed).
+                # Explicit completion notification is informational only. Do not inject a synthetic
+                # message event: ordinary process completion must never create an autonomous Hermes turn.
+                # wait/log consumption remains authoritative and suppresses duplicate delivery.
                 if agent_notify and not process_registry.is_completion_consumed(session_id):
                     completion_evt = self._build_process_completion_event(watcher, session, session_id)
-                    synth_text = format_process_notification(completion_evt)
-                    if not synth_text:
-                        break
-                    delivered = await self._enqueue_process_completion_notification(synth_text, completion_evt)
-                    if delivered is False:
-                        # The process remains terminal; retry after failed adapter injection instead
-                        # of suppressing the result.
-                        continue
+                    message_text = format_process_notification(completion_evt)
+                    if message_text:
+                        await self._send_watcher_message(
+                            platform_name, chat_id, thread_id, message_text, watcher,
+                        )
                     break
                 # Text-only notification; skip when already consumed via wait/log (the agent_notify branch
                 # FALLS THROUGH here, hence the re-check).

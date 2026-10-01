@@ -124,7 +124,7 @@ async def test_internal_event_bypasses_authorization(monkeypatch, tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_notify_on_complete_uses_session_store_origin_for_group_topic(monkeypatch, tmp_path):
+async def test_notify_on_complete_sends_user_notification_for_group_topic(monkeypatch, tmp_path):
     import tools.process_registry as pr_module
     from gateway.session import SessionSource
 
@@ -165,15 +165,11 @@ async def test_notify_on_complete_uses_session_store_origin_for_group_topic(monk
 
     await runner._run_process_watcher(watcher)
 
-    assert adapter.handle_message.await_count == 1
-    event = adapter.handle_message.await_args.args[0]
-    assert event.internal is True
-    assert event.source.platform == Platform.TELEGRAM
-    assert event.source.chat_id == "-100"
-    assert event.source.chat_type == "group"
-    assert event.source.thread_id == "42"
-    assert event.source.user_id == "user-42"
-    assert event.source.user_name == "alice"
+    adapter.handle_message.assert_not_awaited()
+    adapter.send.assert_awaited_once()
+    assert "proc_test_internal" in adapter.send.await_args.args[1]
+    assert adapter.send.await_args.args[0] == "-100"
+    assert adapter.send.await_args.kwargs["metadata"]["thread_id"] == "42"
 
 
 @pytest.mark.asyncio
