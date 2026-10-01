@@ -1127,6 +1127,11 @@ class _CodexStreamGuard:
         if total_timeout is not None:
             self.no_progress_timeout = min(self.no_progress_timeout, float(total_timeout))
         self.hard_deadline = self._start + _aux_stream_total_ceiling(total_timeout)
+        # An explicit per-request timeout is a hard upper bound, even when the stream keeps
+        # producing lifecycle/progress events. The larger configured ceiling only applies when
+        # no request-specific timeout was supplied.
+        if total_timeout is not None:
+            self.hard_deadline = min(self.hard_deadline, self._start + float(total_timeout))
         # The waiting host's absolute deadline clamps the ceiling so the watchdog Timer severs
         # the socket the instant the host stops waiting — a stream blocked between events
         # can't be stopped by a per-event check.
@@ -1165,7 +1170,13 @@ class _CodexStreamGuard:
             self._attempt_stream = stream
 
     def release_stream(self, stream: Any) -> None:
-        """Owner-side: close the attempt stream silently and forget it."""
+        """Owner-side: close the attempt stream silently and forget it.
+
+        On explicit host cancellation the watchdog owns delayed cleanup; closing here would
+        tear down a stream that may still share the cached client's transport with another call.
+        """
+        if self.cancel_requested():
+            return
         _close_quietly(stream, None)
         with self._attempt_stream_lock:
             self._attempt_stream = None
@@ -1301,7 +1312,7 @@ class _CodexStreamGuard:
     def finish(self) -> None:
         """Owner ``finally``: stop the watchdog and release FDs a stranger-thread timeout only shut down."""
         self.stream_finished.set()
-        if self._timer is not None:
+        if self._timer is not None and not self.cancel_requested():
             self._timer.cancel()
         # Gated on timeout_release_pending, NOT timed_out: after a hard-cancel the shared
         # client must stay usable for other sessions.
@@ -1469,9 +1480,61 @@ class _CodexCompletionsAdapter:
                 if hasattr(event_stream, "output"):
                     final = event_stream
                 else:
-                    final = _consume_codex_event_stream(
-                        event_stream, model=str(resp_kwargs.get("model") or model), on_event=guard.on_event
+                    # Keep stream consumption off the caller thread. A third-party iterator may
+                    # block between events and Python cannot asynchronously interrupt that frame;
+                    # the caller must still be able to enforce its wall-clock deadline.
+                    consumed = {}
+                    consumed_error = {}
+                    consumed_done = threading.Event()
+
+                    consume_context = contextvars.copy_context()
+                    consume_hooks = (
+                        (_aux_progress, getattr(_aux_progress, "hook", None)),
+                        (_aux_dispatch, getattr(_aux_dispatch, "hook", None)),
+                        (_aux_provider_response, getattr(_aux_provider_response, "hook", None)),
                     )
+
+                    def _consume() -> None:
+                        for local, hook in consume_hooks:
+                            if hook is not None:
+                                local.hook = hook
+                        try:
+                            consume_context.run(
+                                lambda: consumed.__setitem__(
+                                    "final",
+                                    _consume_codex_event_stream(
+                                        event_stream,
+                                        model=str(resp_kwargs.get("model") or model),
+                                        on_event=guard.on_event,
+                                    ),
+                                )
+                            )
+                        except BaseException as exc:  # propagate on the owner thread
+                            consumed_error["error"] = exc
+                        finally:
+                            for local, hook in consume_hooks:
+                                if hook is not None:
+                                    try:
+                                        del local.hook
+                                    except AttributeError:
+                                        pass
+                            consumed_done.set()
+
+                    threading.Thread(
+                        target=_consume,
+                        name="codex-aux-stream",
+                        daemon=True,
+                    ).start()
+                    while not consumed_done.wait(0.005):
+                        # The watchdog owns total-timeout arbitration. Poll only explicit host
+                        # cancellation here so timeout-vs-cancel races remain linearized by the timer.
+                        if guard.timed_out.is_set():
+                            raise TimeoutError(guard.timeout_message())
+                        if guard.cancel_requested():
+                            guard.check_cancelled()
+                    if "error" in consumed_error:
+                        raise consumed_error["error"]
+                    final = consumed.get("final")
             finally:
                 guard.release_stream(event_stream)
             if final is None:
